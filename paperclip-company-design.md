@@ -314,10 +314,10 @@ paperclip 把信任邊界畫在**執行位置**上：本機 = 全開；**remote 
 |---|---|---|---|
 | **1** | 1 個 codex agent、1 個 issue、只有 `paperclip` skill | **codex 會不會回呼 API** —— 這是整個設計的地基 | 自己 checkout、留言、把狀態改成 done；檔案真的改了 |
 | **2** | ＋ `request_confirmation` | 閘門會不會真的擋 | 停在 `in_review` **而且沒有繼續建子任務** ← 後半句才是重點 |
-| **3** | ＋ watchdog（**手動造假 done**） | **唯一會質疑「agent 說做完了」的防線** | watchdog 醒來、抓到、推回去 |
+| **3** | ＋ watchdog 對照（停滯與假完成） | terminal／non-terminal subtree 的事後查證是否可靠 | watchdog 醒來、巡完整 subtree、留下 durable verdict；observation-only 測試不得擅改 source issue |
 | **4** | 全部 | 完整一輪真實小專案，你在旁邊看 | 五階段檔案齊全、兩道閘門都停過、產出是你要的 |
 
-**然後才是你去睡覺。**
+**然後進入受控 shadow-production；故障注入與 soak 通過後，才談你去睡覺。**
 
 ### 各步驟細節
 
@@ -659,8 +659,11 @@ const leaves = included
 
 ## 尚未驗證
 
-- 步驟 4（完整一輪，含 reviewspec 五階段）
-- 全部項目在 **Mac** 上重跑
+- 真實既有 repo 的 shadow-production 任務（非乾淨 fixture）
+- provider quota、server restart、dead PID、double wake、dirty worktree 等故障注入矩陣
+- shared workspace 在狀態切換競爭下的真正互斥／fencing；單看兩個 agent 的 `running` 狀態不足以證明沒有重疊寫入
+- 12–24 小時、6–10 stages 的長時間 soak test，以及 DONE 後 scheduler silent no-op
+- production deployment、不可逆外部 side effect、正式資料／secrets 操作（目前不應授權）
 
 ---
 
@@ -780,7 +783,7 @@ done
 
 ## 8. 每個實作任務都要掛 `executionPolicy`
 
-**這是防謊報完成的唯一防線**（watchdog 不管 `done`，見驗證步驟 3）：
+**這是阻止單一實作 issue 由 coder 自行結案的事前防線。** 現行 watchdog 能在 terminal subtree 上做事後查證，reviewspec blocker chain 也能讓整體交付等到獨立 review；但兩者都不等於禁止 coder 把自己的 build issue 標成 `done`。若產品要求「實作者本人不能結案」，仍必須掛 `executionPolicy`：
 
 ```json
 {
@@ -800,12 +803,12 @@ done
 
 | 步 | 測什麼 | 通過訊號 |
 |---|---|---|
-| 1 | 1 個 codex agent + 瑣碎任務 | 自己 checkout、留言、改狀態；檔案真的被改 |
-| 2 | ＋ `request_confirmation` | 停在 `in_review` **且未建立子任務** |
-| 3b | ＋ `executionPolicy` review stage | coder **無法**自行結案；runtime 自動轉交 reviewer；reviewer 實際取證 |
-| 4 | 全部（含 reviewspec 五階段） | 五階段檔案齊全、兩道閘門都停過 |
+| 1 | 1 個 codex agent + 瑣碎任務 | ✅ 自己 checkout、留言、改狀態；檔案真的被改；session reuse 未重複修改 |
+| 2 | ＋ `request_confirmation` | ✅ 停在 `in_review`、confirmation pending、**0 子任務**、repo hash 不變 |
+| 3 | ＋ watchdog 對照 | ✅ 現行 Mac commit 對 terminal tree／零非終結 leaves 也會觸發；reviewer 必須巡完整 subtree，不能只信 `Stopped leaves` |
+| 4 | 全部（含 reviewspec 五階段） | ✅ 五階段 artifact／commit 齊全、G2/G3 都真停過、10/10 tests、獨立 review PASS、registry 與 final watchdog 完成 |
 
-> 步驟 3（watchdog 抓假 `done`）**已知不會通過，不要浪費時間重測**。若要驗 watchdog 本身是否運作，用陽性對照：葉節點停在 `in_review` 且無審查者。
+> ⚠️ WSL2 舊紀錄中的「terminal `done` 不觸發 watchdog」**不適用目前 Mac 驗證所跑的 commit**。現行行為會對 terminal root + terminal child 產生 fingerprint，runtime context 甚至可能顯示 `Stopped leaves: No leaf issues found.`。因此 watchdog mandate 必須是 observation-only，並明文要求巡查完整 subtree、issue comments、commits、tests 與 artifact；不能把空 leaf list 當成「沒有工作可查」。
 
 ## 10. 收工紀律
 
@@ -816,3 +819,119 @@ done
 curl -X DELETE ".../api/issues/<id>/watchdog"
 curl -X PATCH  ".../api/agents/<id>" -d '{"status":"paused"}'
 ```
+
+---
+
+# Mac 實機驗證結果（2026-08-18）
+
+## 裁定
+
+**步驟 1–4 全部通過；Paperclip 已具備進入「受控真實 repo／shadow-production」測試的條件，但尚未證明可無人值守操作 production 或不可逆 side effect。**
+
+這個裁定只建立在 durable product evidence 上：issue/document/interaction 狀態、blocker relation、Git commits、repo artifacts、實際測試與 reviewer verdict。Server listening、port healthy、wakeup `202` 或 agent `running` 都只算基礎設施訊號，不算 E2E 通過。
+
+## 隔離與正式 skill 匯入
+
+- Test company：丟棄式 Mac E2E company。
+- Step 4 repo：`/private/tmp/paperclip-reviewspec-step4-mac-20260818`，全新 `main`、乾淨 baseline，避免沿用步驟 1 的 `README.md` 修改與舊 agent session。
+- Build ID：`mac-text-count-cli-v1`；目標是零相依 Python 3 CLI，讀 UTF-8 text file，輸出 deterministic JSON line／word／character counts。
+- Reviewspec skills 不是靠 prompt 假裝：正式取得 `reviewspec-core`、`diverge`、`converge`、`design-review`、`build`、`review`。
+- 直接從未註冊路徑匯入先被 `403 skill_workspace_boundary_denied` 擋下；建立正式 skill-source project/workspace 後才成功匯入。這證明 workspace boundary 是真的 enforcement，不只是文件規則。
+- 四個獨立角色：planner、design reviewer、coder、code reviewer；shared workspace 設為 serialize。
+
+## 五階段 durable evidence
+
+### 1. Diverge／Converge 與 G2
+
+- Root issue：`MAC-15`（`5b5b1bc0-300d-4af2-9d94-443a1c29112f`）。
+- Planner 產生並 commit：
+  - `docs/reviewspec/mac-text-count-cli-v1/explore.md`
+  - `docs/reviewspec/mac-text-count-cli-v1/spec.md`
+- G2 artifact commit：`38de2818893ca089c54c3161b564fe242672c1c6`。
+- Spec validator：PASS；repo worktree clean。
+- Plan revision：`83270872-564f-45b4-b906-31f4bc644cbb`。
+- `request_confirmation`：`957a049b-85bc-4483-9c55-c57f300e633d`，真的停在 board gate；批准前 downstream pipeline issue 為 0。
+- 人類批准後 planner 自動恢復，建立 blocker chain：`MAC-17 → MAC-18 → MAC-19`。API read-back 證實 relation，不是靠 title／status 推測。
+
+### 2. G3 design review
+
+- `MAC-17` 只建立一個 batched `ask_user_questions` interaction：`56e866ae-83a7-4a52-a300-1ff2a32ef044`。
+- 三個 load-bearing semantics 一次決定：
+  1. Universal newlines（LF／CRLF／lone CR）
+  2. 尾端換行不增加空白行；空檔為 0 行
+  3. Unicode whitespace（Python `str.split()`）
+- Design reviewer 在回答前不寫 production code；回答後產生 `design-review.md`。
+- G3 commit：`7b156ca8b7a7e6a45f2c93f602d452232f4e607e`。
+- `MAC-18` 在 `MAC-17` done 前維持 blocked，完成後由 relation 自動釋放，沒有手動 wake。
+
+### 3. Build
+
+- Build commit：`9cc37506c69f03f4cd41ab5b0e860aa410d41db5`。
+- 產物：`text_count.py`、`tests/test_text_count_cli.py`、README、`manifest.md`。
+- Coder 保存 red→green 證據，並對 INT-1～INT-4 做 controlled break-test；每個 deliberate break 都讓語意相關測試變紅，恢復後全綠。
+- Paperclip work products 同時記錄 commit 與 workspace manifest，不只是一則「Done」留言。
+- Coder 不寫 `review.md`、不自我批准；`MAC-19` 在 build done 後才自動解鎖。
+
+### 4. Independent review、registry 與終檢
+
+- Reviewer 先由 spec + G3 design record 自建 answer key，再讀 tests；不是照抄 coder manifest。
+- Reviewer 自己 mutation test Critical/Core intents，確認每個違規 mutation 會讓對應測試變紅；production code、tests、README 最終未被 reviewer 修改。
+- Review commit：`7ece3d87e27e6cae5abd0f5be6378ad63a5f4727`。
+- `review.md`：`Verdict: PASS`。
+- `REGISTRY.md`：4 個 active intents，三個 Critical、一個 Core，各自綁定 guarding test。
+- Hermes 獨立重跑：`python3 -m unittest discover` → **10/10 PASS**；spec validator PASS；成功／錯誤 CLI path 均實際執行；worktree clean。
+- Final watchdog 對完成後 fingerprint 重新巡查完整 subtree、commits、artifacts 與 10/10 tests，裁定「genuinely complete」；fingerprint read-back 滿足 `lastReviewedFingerprint == lastObservedFingerprint`。
+
+最終 artifact chain：
+
+```text
+fc0aebc  baseline fixture
+38de281  explore + spec (G2)
+7b156ca  design review (G3)
+9cc3750  implementation + tests + manifest
+7ece3d8  independent review PASS + registry
+2a21e9c  review metadata citation correction
+```
+
+## 本輪最有價值的發現
+
+### A. Durable gates 與 blocker chain 成立
+
+G2/G3 都不是 prompt 裡說「請等待」而已：interaction、revision、resolver policy 與 issue status 都持久化；downstream issue 在 gate 完成前確實 blocked，完成後由 relation 自動推進。這是 Paperclip 作為 orchestrator 最核心、也最有價值的證據。
+
+### B. 真實產物證據可壓過 agent／process 狀態
+
+Issue done、agent idle、PID exit 都不是完成證據；commit、manifest、tests、review、registry 才是。反過來，provider callback 失敗也不等於 durable work 失敗。本輪最後一個 citation 修正已成功 commit，但 Claude 在狀態回寫時撞上 session limit；Owner 依 exact commit scope、tests、validator、clean tree 收斂 issue，而不是丟棄有效工作重跑。
+
+### C. Provider quota 是控制面事件，不應混成產品失敗
+
+Claude session limit 發生後：
+
+- 已提交 artifact 保留；
+- issue completion callback 中斷；
+- 新 fingerprint 的額外 watchdog model pass 無法完成；
+- Agent 正確顯示 `error`，不能謊稱 idle。
+
+正確處理是保存 nonzero-exit diagnostic、驗證 durable artifact、由 Owner／board 收斂狀態、停用測試 watchdog 防止重試燒額度。這揭露下一階段要補強的能力：**provider failure 後的自動 Owner remediation、callback replay 與 quota episode dedupe**。
+
+### D. Watchdog 必須看完整 subtree，不能只看 leaf 摘要
+
+現行 terminal tree 也能觸發 fingerprint，而 resume payload 可能寫 `No leaf issues found.`。如果 reviewer 只讀這一行會產生假陰性；本輪 observation-only reviewer 主動巡 commits、comments、artifacts、tests，才能抓出只有「Done.」卻沒有 work product 的假完成。這條應固化進 watchdog mandate 與測試。
+
+### E. 狀態序列化不等於已證明 filesystem fencing
+
+Stage 交接瞬間曾短暫看到上一角色與下一角色同為 `running`；Git 邊界本輪保持乾淨，沒有證據顯示實際重疊寫入，但這也**不能證明 serialize 在所有 race 下成立**。下一輪必須用 controlled overlap、authority tuple、workspace lock 與 dirty-scope probes 驗真正互斥，而不是看 dashboard status。
+
+### F. Watchdog 自己也會製造昂貴狀態變更
+
+G2、G3、build/review transition、metadata correction 都可能產生新 fingerprint。若把「每個新 fingerprint」都交給昂貴模型，合法 gate 和小型 metadata 修正也會反覆喚醒 reviewer。測試結束必須 DELETE watchdog；正式環境需 rate limit、quota gate、episode dedupe 與「terminal no semantic mutation」判斷。
+
+## 投入實戰的邊界
+
+**可以開始：** 5–10 個真實 repo 的低風險 shadow-production 任務，使用獨立 branch/worktree、禁止 push `origin/main`、禁止 production deployment，最終 merge 仍由人決定。
+
+**下一輪必測：** dirty worktree 中斷、commit 前後 quota、server restart、dead PID ± valid result、duplicate wake、重複 reviewer rejection／circuit breaker、shared-workspace overlap、12–24 小時 soak、DONE 後 silent no-op。
+
+**仍不可授權：** production deployment、destructive migration、付款／購買、secrets／權限變更、正式資料、對外發布、不可逆第三方 API side effect。
+
+因此目前成熟度應描述為：**受控內部實戰 ready；無人值守 low-risk 尚待故障注入與 soak；production autonomous operator 尚未 ready。**
