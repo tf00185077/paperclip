@@ -661,3 +661,158 @@ const leaves = included
 
 - 步驟 4（完整一輪，含 reviewspec 五階段）
 - 全部項目在 **Mac** 上重跑
+
+---
+
+# Mac 施工手冊
+
+WSL2 那一輪的所有已知坑都已內建在下列步驟中。**照順序做，不要跳。**
+
+## 0. 憑證收斂（在任何 agent 跑起來之前）
+
+見第 9 節。這是唯一不依賴 agent 行為的防線 —— 工具層確認預設關閉、macOS 無本機沙箱。
+
+```bash
+gh auth status                 # scope 是什麼
+ls -la ~/.ssh                  # 有無能連回其他機器的 key
+cat ~/.npmrc 2>/dev/null       # 發布 token
+ls ~/.aws ~/.config/gcloud 2>/dev/null
+```
+
+git push 權限收斂成只給目標 repo 的 fine-grained token。
+
+## 1. Node（免 sudo，官方 tarball + 校驗）
+
+```bash
+cd ~
+curl -fsSL -o node.tar.xz https://nodejs.org/dist/v24.19.0/node-v24.19.0-darwin-arm64.tar.xz
+curl -fsSL -O https://nodejs.org/dist/v24.19.0/SHASUMS256.txt
+grep 'node-v24.19.0-darwin-arm64.tar.xz$' SHASUMS256.txt > node.sha
+mv node.tar.xz node-v24.19.0-darwin-arm64.tar.xz
+shasum -a 256 -c node.sha          # 必須顯示 OK，否則停止
+mkdir -p ~/.local && tar -xJf node-v24.19.0-darwin-arm64.tar.xz -C ~/.local
+mv ~/.local/node-v24.19.0-darwin-arm64 ~/.local/node
+echo 'export PATH="$HOME/.local/node/bin:$PATH"' >> ~/.zshrc
+```
+
+> ⚠️ 檔名是 `darwin-arm64`，不是 WSL2 用的 `linux-x64`。
+
+## 2. CLI 安裝與登入
+
+```bash
+npm install -g @anthropic-ai/claude-code @openai/codex
+claude    # 訂閱登入，完成後 /exit
+codex     # ChatGPT 訂閱登入
+```
+
+**不要設 `ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`** —— 設了會改走 API 計費，整個成本模型失效。
+
+驗證走訂閱而非 API key：
+
+```bash
+python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.codex/auth.json')));print('API key:', d.get('OPENAI_API_KEY'))"
+# 必須是 None
+```
+
+## 3. paperclip（釘同一版）
+
+```bash
+npx --yes --registry https://registry.npmjs.org paperclipai@2026.811.0-beta.0 \
+  install --version 2026.811.0-beta.0 -y
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+paperclipai --version    # 必須顯示 "managed npm pinned"
+```
+
+Onboard —— **Mac 用 tailnet**（與 WSL2 測試環境的 loopback 不同，這是刻意的正式設定）：
+
+```bash
+paperclipai onboard -y --bind tailnet --install-service
+```
+
+## 4. ⚠️ 服務 PATH（WSL2 踩過的坑，macOS 同樣會踩）
+
+macOS 用 **LaunchAgent** 而非 systemd。服務的 PATH 不含 `~/.local/node/bin`，會導致 `codex-acp` 以 `exit 127` 失敗。
+
+檢查 `~/Library/LaunchAgents/` 底下的 paperclip plist，確認其 `EnvironmentVariables` 的 `PATH` 含有：
+
+```
+/Users/<user>/.local/node/bin:/Users/<user>/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+```
+
+改完 `launchctl unload` + `load` 重載。**這一步不做，步驟 1 必定失敗。**
+
+## 5. Skills（走 git，不要手動搬檔）
+
+```bash
+C=<companyId>
+git clone https://github.com/tf00185077/skills.git \
+  ~/.paperclip/instances/default/skills/$C
+```
+
+repo 頂層即 `<slug>/SKILL.md` 佈局，與 managed root 要求吻合，**日後 `git pull` 就更新全部**。
+
+再逐一匯入（略過 `reviewspec-dispatch` 與 `think-like-fable`）：
+
+```bash
+for s in reviewspec-core reviewspec-diverge reviewspec-converge \
+         reviewspec-design-review reviewspec-build reviewspec-review; do
+  curl -sS -X POST "http://127.0.0.1:3100/api/companies/$C/skills/import" \
+    -H 'Content-Type: application/json' \
+    -d "{\"source\":\"$HOME/.paperclip/instances/default/skills/$C/$s\"}"
+done
+```
+
+> 匯入來源必須位於 managed skills root 或 project workspace `cwd`，否則 403。
+
+## 6. 建立 agent 時的必要覆寫
+
+| 項目 | 預設 | 必須改成 | 原因 |
+|---|---|---|---|
+| `runtimeConfig.heartbeat.maxConcurrentRuns` | **20** | **1** | 第 2 節序列化執行 |
+| `role` | — | 列舉值之一 | 沒有 `planner`，用 `pm` |
+| `adapterConfig.timeoutSec` | 0（無限） | 設一個上限 | 第 8 節結構性節流 |
+
+**skills 為公司共用**（見施工實記第 1 項），因此 planner 的 `AGENTS.md` 必須明文禁止使用 `reviewspec-build` 或自行實作。
+
+## 7. workspace（不要只設 `cwd`）
+
+`cwd` 只是 fallback。要讓 `docs/reviewspec/<build>/` 落在目標 repo，**必須正式掛 project / execution workspace**。否則 run 會落到 `~/.paperclip/instances/default/workspaces/<agentId>` 這個空目錄。
+
+## 8. 每個實作任務都要掛 `executionPolicy`
+
+**這是防謊報完成的唯一防線**（watchdog 不管 `done`，見驗證步驟 3）：
+
+```json
+{
+  "executionPolicy": {
+    "mode": "normal",
+    "commentRequired": true,
+    "stages": [
+      { "type": "review", "participants": [{ "type": "agent", "agentId": "<code-reviewer>" }] }
+    ]
+  }
+}
+```
+
+寫進 planner 的 `AGENTS.md` 成為拆任務時的硬性規則。
+
+## 9. 驗證（在丟棄式 test company 內，一次只開一層）
+
+| 步 | 測什麼 | 通過訊號 |
+|---|---|---|
+| 1 | 1 個 codex agent + 瑣碎任務 | 自己 checkout、留言、改狀態；檔案真的被改 |
+| 2 | ＋ `request_confirmation` | 停在 `in_review` **且未建立子任務** |
+| 3b | ＋ `executionPolicy` review stage | coder **無法**自行結案；runtime 自動轉交 reviewer；reviewer 實際取證 |
+| 4 | 全部（含 reviewspec 五階段） | 五階段檔案齊全、兩道閘門都停過 |
+
+> 步驟 3（watchdog 抓假 `done`）**已知不會通過，不要浪費時間重測**。若要驗 watchdog 本身是否運作，用陽性對照：葉節點停在 `in_review` 且無審查者。
+
+## 10. 收工紀律
+
+測試告一段落時務必止血，否則停滯子樹會持續觸發 watchdog 燒訂閱額度：
+
+```bash
+# 移除測試 watchdog、收尾未終結任務、暫停所有 agent
+curl -X DELETE ".../api/issues/<id>/watchdog"
+curl -X PATCH  ".../api/agents/<id>" -d '{"status":"paused"}'
+```
