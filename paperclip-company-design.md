@@ -376,3 +376,288 @@ runtime 選審查者時**自動排除實作者本人**。不是靠 coder 記得�
 每個 agent 有自己的 `CODEX_HOME`：`<instance>/companies/<id>/agents/<agentId>/codex-home`，且**強制 `OPENAI_API_KEY=""`** —— agent 永遠不能用主機 API key 花錢、不能共用他人 codex 狀態。訂閱認證從主機 `auth.json` symlink 過去（**所有 codex agent 共用同一份訂閱額度**）。
 
 無可用憑證時 fail-fast（`adapter_failed`），不會發出未認證請求。
+
+> ⚠️ **上段描述的是 CLI lane。實測發現 ACPX lane 行為不同 —— 見下方「施工實記」第 1 項。**
+
+---
+
+# 施工實記（2026-08-17，WSL2 測試環境）
+
+## 環境定案
+
+| 項目 | 值 |
+|---|---|
+| 版本 | **`2026.811.0-beta.0`（managed npm pinned）** —— 見下方「為何不用 stable」 |
+| fork 分支 | `pinned/2026.811.0-beta.0`（commit `8f7b8b3fd`）、`design/autonomous-company` |
+| Node | 24.19.0，官方 tarball + SHA-256 驗證，裝在 `~/.local/node`（免 sudo） |
+| CLI | Claude Code 2.1.232、codex-cli 0.147.0（原生 Linux；`claude.exe` 只是檔名，內容是 ELF） |
+| 部署 | `local_trusted` / loopback / `127.0.0.1:3100`、embedded-postgres |
+| test company | `Verify Lab`，prefix `VER` |
+
+## 為何釘 beta 而不是 stable
+
+實測比對 `v2026.722.0`（stable）與分析用的 master：**設計依賴的機制幾乎全部存在**（pipeline autonomy 阻擋、agent approver、`subscription_included` 記 0、sandbox Linux-only、executionPolicy 排除實作者、`request_confirmation`、watchdog、rewake throttle 參數一致）。
+
+但 stable 缺兩項：
+
+1. **`cross-issue-influence-limit`（單次 run 跨 issue 寫入上限 20）不存在。**
+2. **`c481be44e fix(task-watchdogs): deduplicate unchanged stopped-state wakes` 沒趕上** —— stable 7/22 切，修正 7/25 合併。缺這個代表**某類未改變的停止狀態會重複喚醒 watchdog**，而預算斷路器對訂閱制失效、且發生在無人值守時段。
+
+beta `2026.811.0-beta.0` 兩項都有。**釘住某個 beta ≠ 跟隨 beta 頻道** —— 版本凍結，只在明確下指令時升級。**降版是單向門**（schema 較新），切換前必須備份。
+
+## 五項實測發現（設計文件原本沒寫）
+
+### 1. ACPX lane 的 skills 是公司共用，不是 per-agent
+
+Node ≥ 22.13 時 auto 選 **ACPX lane**（本專案 24.19，所以預設走這條），與文件描述的 CLI lane 不同：
+
+| 層面 | 實測結果 |
+|---|---|
+| 指令 `AGENTS.md` | ✅ per-agent：`companies/<id>/agents/<agentId>/instructions/AGENTS.md` |
+| skills | ⚠️ **公司共用**：`companies/<id>/codex-home/skills/`，全實例只有這一個 codex-home |
+
+**對四人編制的影響**：planner 與 coder 同為 Codex，共用 skills 目錄。緩解因素是 `reviewspec-diverge` / `converge` / `design-review` 都設了 `disable-model-invocation: true`，不會自動觸發；真正共用且自動可觸發的只有 `reviewspec-core` 與 `reviewspec-build`。
+
+**`engine: "cli"` 已實測，不能解決。** CLI lane 的 run log 同樣顯示：
+
+```
+[paperclip] Using Paperclip-managed Codex home ".../companies/<companyId>/codex-home"
+```
+
+**兩條 lane 都是公司層級。文件描述的 `agents/<agentId>/codex-home` 在 `2026.811.0-beta.0` 上不存在。**
+
+唯一的隔離手段是 `env: { CODEX_HOME: ... }` 逐 agent 覆寫，但代價明確：外部覆寫被視為 self-managed，**永不注入訂閱認證** —— 每個 home 都要手動 symlink `auth.json`，且 paperclip 不再維護。
+
+**決議：接受公司共用，不買隔離。** 理由：
+
+1. 共用目錄裡會自動觸發的只有 `reviewspec-core` 與 `reviewspec-build`；`diverge` / `converge` / `design-review` 皆設 `disable-model-invocation: true`。
+2. 真正的風險（planner 自行實作）**已被結構擋住**，非僅靠 prompt：`request_confirmation` 閘門在建立實作子任務前即停止；且 `paperclip` skill 明訂「計畫被接受後，來源 issue 可建子任務，**但不得在來源 issue 上開始實作**」。
+3. 買隔離等於引入 paperclip 不維護的手工設定（四個 home、四次 symlink），拿確定的維護負擔換已被兩層結構擋住的風險。
+
+**對策**：planner 的 `AGENTS.md` 明文禁止使用 `reviewspec-build` 或自行實作。若日後實際觀察到越界，再回來評估 `CODEX_HOME` 覆寫。
+
+### 2. systemd service 的 PATH 不含 node
+
+service 預設 PATH 只有系統目錄，導致 `codex-acp`（node 腳本）以 `exit 127` 失敗。**Mac 上會遇到同樣問題。**
+
+修法（使用者層級 drop-in，免 sudo，不會被重新產生的 unit 洗掉）：
+
+`~/.config/systemd/user/paperclipai.service.d/10-path.conf`
+
+```ini
+[Service]
+Environment="PATH=/home/<user>/.local/node/bin:/home/<user>/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+```
+
+### 3. `maxConcurrentRuns` 預設 20
+
+與序列化執行（第 2 節）衝突。**建立 agent 後必須改成 1。**
+
+### 4. `cwd` 只是 fallback，不是權威
+
+首次 run 的日誌：`No project or prior session workspace was available. Using fallback workspace ".../workspaces/<agentId>"`。
+
+workspace 解析優先於 `adapterConfig.cwd`。**要讓 `docs/reviewspec/<build>/` 落在目標 repo，必須正式掛 project / execution workspace，不能只設 `cwd`。**
+
+### 5. 建立 company 會自動產生兩個 agent
+
+`Reflection Coach`、`Summarizer`，狀態 `paused`。不是 `core-exec-team`（`onboard -y` 不建 company，是 company 建立時附帶的），但要知道它們存在。
+
+## WSL2 特有事項
+
+**WSL2 在沒有 session 時會關掉整個 distro VM，systemd 跟著死 —— `Linger=yes` 擋不住。**
+
+要跑整夜無人值守測試，`C:\Users\<user>\.wslconfig` 需加：
+
+```ini
+[wsl2]
+vmIdleTimeout = -1
+```
+
+否則關掉終端機後 agent 全部停止，早上會誤判成設計問題。**Mac 上不存在此問題。**
+
+## 驗證步驟 1：✅ 通過（2026-08-17）
+
+**命題**：codex 會不會主動回呼 Paperclip API —— 整份設計的地基。
+
+| 證據 | 結果 |
+|---|---|
+| 任務狀態 | `todo` → **`done`**（agent 經由 API 變更） |
+| Agent 留言 | 「Done — appended one line to README.md: hello from paperclip」 |
+| 實際檔案 | `README.md` 確實被修改 |
+| `wakeOnAssignment` | ✅ 指派即觸發 run |
+| session 續接 | ✅ `sessionReused: true` + `persistedSessionId` |
+
+**同時實測證實第 8 節推論**：
+
+```json
+{ "billingType": "subscription_included", "costStatus": "unpriced", "biller": "chatgpt" }
+```
+
+訂閱制執行確實不產生價格 → **預算斷路器不會觸發**，第 8 節的結構性節流是必要的，不是保險。
+
+## Skill 安裝方式（已定案）
+
+skills repo `https://github.com/tf00185077/skills.git` **直接 clone 進 managed skills root**：
+
+```
+<instance>/skills/<companyId>/
+```
+
+repo 頂層剛好是一個個 skill 資料夾，與 paperclip 要求的 `<managedRoot>/<slug>` 佈局吻合，**因此 `git pull` 即可更新全部 skill**，不需手動搬檔。Mac 上用同一套流程。
+
+匯入 API `POST /api/companies/:companyId/skills/import` 只接受 `{ source }`，且**強制邊界檢查**：來源必須位於 managed skills root 或已設定的 project workspace `cwd`，否則 403 `skill_workspace_boundary_denied`。
+
+已匯入六個（刻意略過 `reviewspec-dispatch`，因 paperclip 負責編排；略過 `think-like-fable`，最小起步）：
+`reviewspec-core` / `diverge` / `converge` / `design-review` / `build` / `review`
+
+**另註**：`role` 是固定列舉 —— `ceo` / `cto` / `cmo` / `cfo` / `security` / `engineer` / `designer` / `pm` / `qa` / `devops` / `researcher` / `general`。沒有 `planner`，用 `pm`。
+
+## 驗證步驟 2：✅ 通過（2026-08-17）
+
+**命題**：`request_confirmation` 閘門是否真的擋住後續工作。
+
+| 檢查項 | 結果 |
+|---|---|
+| 任務停在 `in_review` | ✅ |
+| `plan` 文件建立 | ✅ revision 1 |
+| **未建立任何實作子任務** | ✅ **0 個** ← 關鍵 |
+| `request_confirmation` 存在且 `pending` | ✅ |
+| planner 未寫任何原始碼 | ✅ |
+
+**revision 綁定確認 —— 第 4 節的設計假設成立：**
+
+```json
+"target": {
+  "type": "issue_document",
+  "key": "plan",
+  "revisionId": "760e8b7b-e636-4d67-acda-f40eba424670",
+  "revisionNumber": 1
+}
+```
+
+**兩項超出設計假設的保護：**
+
+1. **`effectiveResolverPolicy: "board_only"`** —— 此確認**只有人類董事會成員能解除，agent 無法自我批准**。伺服器層強制，非 prompt 約束。
+2. **`supersedeOnUserComment: true` + `rejectRequiresReason: true`** —— 使用者留言即作廢既有確認（防過期批准），駁回強制填寫理由。
+
+另有 `idempotencyKey: "confirmation:<issueId>:plan:<revisionId>"`，同版計畫不重複發出確認。
+
+## 驗證步驟 3：⚠️ 機制正常，但涵蓋範圍與文件不符（2026-08-18）
+
+**命題**：watchdog 是否抓得到無證據的假 `done`。**答案：不會。**
+
+### 對照實驗
+
+| 情境 | watchdog 反應 |
+|---|---|
+| 葉節點 `in_review`、無審查者（非終結） | ✅ **觸發** —— `triggerCount: 1`、建立 `originKind: task_watchdog` 審查任務、以 `wakeReason: task_watchdog_stopped_subtree` 喚醒 Claude agent |
+| 葉節點 `done`、留言僅「Done.」無任何證據 | ❌ **完全不觸發**，`lastObservedFingerprint` 始終為 null |
+
+### 程式碼證據
+
+`server/src/services/task-watchdogs.ts:31`：
+
+```ts
+const TASK_WATCHDOG_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
+```
+
+葉節點集合（同檔約 487 行）明確排除終結狀態：
+
+```ts
+const leaves = included
+  .filter((issue) => (includedChildrenByParentId.get(issue.id) ?? []).length === 0)
+  .filter((issue) => !isTerminalIssueStatus(issue.status));   // 排除 done / cancelled
+```
+
+而 `doc/TASK-WATCHDOG.md:20` 宣稱：
+
+> When every leaf in that subtree comes to rest — **done**, cancelled, blocked, in review… Paperclip wakes the watchdog agent to read the evidence and decide whether the stop is legitimate.
+
+**文件與程式碼矛盾。以程式碼為準。**
+
+### 對設計的更正
+
+本文件第 1 節與附錄原先將 watchdog 描述為「唯一會質疑『agent 說做完了』的機制」。**該描述錯誤。**
+
+| 機制 | 實際負責 |
+|---|---|
+| **watchdog** | 工作**停在非終結狀態沒人管**（`in_review` 無真實審查者、`blocked`、有指派卻無活路徑）→ 事後掃描停滯 |
+| **`executionPolicy` review stage** | **防止實作者自行結案** —— runtime 指派審查者且**自動排除實作者本人**，`commentRequired: true` 強制 → 事前擋住結案路徑 |
+
+**一旦任務被標為 `done`，沒有任何機制會回頭查證。** 防謊報完成只能靠 `executionPolicy`，而它必須**逐 issue 掛上**才生效 —— 不掛就沒有防線。
+
+**必要動作**：planner 在拆任務時，必須為每個實作任務掛上帶 review stage 的 `executionPolicy`，並寫入其 `AGENTS.md` 成為硬性規則。這一條原本不在設計裡，是本次驗證補上的。
+
+### 其他確認
+
+- **`claude_local` 首次驗證通過** —— Claude agent 被 automation 喚醒並開始執行。
+- 週期性排程間隔預設 **30 秒**（`HEARTBEAT_SCHEDULER_INTERVAL_MS`，最低 10 秒）。
+- 排程抑制只在 worktree 實例或資料庫還原時生效，一般安裝不受影響。
+- watchdog 首次執行有 15 秒寬限窗（`TASK_WATCHDOG_FIRST_RUN_GRACE_MS`），避免與任務自身的指派 run 競爭。
+
+## 驗證步驟 3b：✅ 通過 —— `executionPolicy` 才是防謊報完成的真防線（2026-08-18）
+
+**命題**：`executionPolicy` 的 review stage 能否阻止實作者自行結案。
+
+設定：任務指派給 coder（Codex），`executionPolicy.stages[0]` 為 `review`，participant 指定 reviewer（Claude）。任務描述**明確要求 coder 自己標成 `done`**。
+
+實際流程（**只喚醒了 coder，reviewer 全自動**）：
+
+1. coder 完成工作、留言、嘗試標記 `done`
+2. **runtime 攔截，自動轉交 reviewer**
+3. reviewer 自動執行並**實際取證**：
+
+> Approved: verified README.md diff shows exactly one appended line `hello under review` at line 30 (**git diff and grep confirmed**)
+
+4. 通過後任務才進入 `done`
+
+最終 `executionState`：
+
+```json
+{
+  "status": "completed",
+  "completedStageIds": ["4381442c-..."],
+  "lastDecisionOutcome": "approved",
+  "returnAssignee": { "type": "agent", "agentId": "<coder>" }
+}
+```
+
+**四項同時成立**：實作者無法自行結案 ✅ · runtime 自動路由 ✅ · 審查者為不同 agent 且不同模型家族 ✅ · **審查者實際跑 git diff / grep 取證，非橡皮圖章** ✅
+
+**這是取代 watchdog 的正確防線。planner 必須為每個實作任務掛上帶 review stage 的 `executionPolicy`。**
+
+---
+
+# 成本實測（第 8 節的門檻依據）
+
+整場驗證共 **23 個 run**，產出僅：三行 README、一份計畫文件、若干狀態變更。
+
+| | tokens |
+|---|---|
+| 新鮮 input | **2,312,716** |
+| 快取 input | 4,896,032 |
+| output | 51,603 |
+
+逐 run（節選）：
+
+| wakeReason | 新鮮 input | 快取 | output | biller |
+|---|---|---|---|---|
+| `step 3b`（coder 實作） | **567,779** | 512,512 | 4,235 | chatgpt |
+| `issue_assigned` | 144k–350k | — | 1.1k–4.9k | chatgpt |
+| `issue_commented` | 165k–219k | — | 1.5k–2.1k | chatgpt |
+| `task_watchdog_stopped_subtree` | 46k–61k | 540k–869k | 5.4k–9.1k | anthropic |
+| **`execution_review_requested`** | **36,695** | 286,596 | 2,513 | anthropic |
+
+## 兩個結論
+
+**1. 第 1 節的服務分派（Codex 生產 / Claude 驗證）在成本上被證實。** 同一件工作，coder 燒 567k 新鮮 input，reviewer 只燒 **36.7k —— 差約 15 倍**。把 reviewer 放在 Claude 幾乎不增加成本。Claude 的快取利用率也明顯較佳。
+
+**2. 第 8 節的 monitor 腳本從「之後再做」升級為「上線前必要」。** 23 個做了幾乎沒實事的 run 就燒掉 230 萬新鮮 input tokens；一個完整的 diverge→converge→design-review→build→review 循環會遠高於此。而我故意製造的**單一停滯子樹，四次 watchdog 觸發就吃掉 20.8 萬** —— 無人值守整夜時，這種消耗會持續發生，且預算斷路器記 $0 不會攔截。
+
+**門檻設定單位：單日新鮮 input tokens，不是 run 數。**
+
+## 尚未驗證
+
+- 步驟 4（完整一輪，含 reviewspec 五階段）
+- 全部項目在 **Mac** 上重跑
