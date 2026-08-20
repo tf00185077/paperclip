@@ -45,7 +45,9 @@
 **Codex 生產、Claude 驗證。** 兩個理由：
 
 1. 換家模型審查 = 真正的第二意見。同模型不同 session 解決了錨定，但解決不了**模型層級的系統性偏差**（同一分布抽兩次仍然相關）。
-2. **可用性**：全押一家 = 撞到訂閱用量上限時整條產線一起停。分兩家 = 兩條獨立供應線。
+2. ~~**可用性**：全押一家 = 撞到訂閱用量上限時整條產線一起停。分兩家 = 兩條獨立供應線。~~
+
+> ⚠️ **第 2 點已被實測推翻。** Mac 完整一輪的 fresh input 分佈是 **Anthropic 98.44% / OpenAI 1.56%**。負載不是兩條供應線，是一條主線加一條支線 —— Anthropic 額度用完等於全停。**換家審查的品質理由（破除相關盲點）仍然成立且已被實證**，可用性理由不成立。詳見「成本實測」。
 
 ### 為什麼兩個 reviewer 要拆開
 
@@ -651,11 +653,96 @@ const leaves = included
 
 ## 兩個結論
 
-**1. 第 1 節的服務分派（Codex 生產 / Claude 驗證）在成本上被證實。** 同一件工作，coder 燒 567k 新鮮 input，reviewer 只燒 **36.7k —— 差約 15 倍**。把 reviewer 放在 Claude 幾乎不增加成本。Claude 的快取利用率也明顯較佳。
+> ⚠️ **結論 1 已被 Mac 完整一輪的實測推翻。** 下方保留原文以記錄推論過程，正確結論見「Mac 完整一輪成本實測」。
 
-**2. 第 8 節的 monitor 腳本從「之後再做」升級為「上線前必要」。** 23 個做了幾乎沒實事的 run 就燒掉 230 萬新鮮 input tokens；一個完整的 diverge→converge→design-review→build→review 循環會遠高於此。而我故意製造的**單一停滯子樹，四次 watchdog 觸發就吃掉 20.8 萬** —— 無人值守整夜時，這種消耗會持續發生，且預算斷路器記 $0 不會攔截。
+**1.** ~~第 1 節的服務分派（Codex 生產 / Claude 驗證）在成本上被證實。同一件工作，coder 燒 567k 新鮮 input，reviewer 只燒 **36.7k —— 差約 15 倍**。把 reviewer 放在 Claude 幾乎不增加成本。~~
+
+**2. 第 8 節的 monitor 腳本從「之後再做」升級為「上線前必要」。** 23 個做了幾乎沒實事的 run 就燒掉 230 萬新鮮 input tokens。而我故意製造的**單一停滯子樹，四次 watchdog 觸發就吃掉 20.8 萬** —— 無人值守整夜時，這種消耗會持續發生，且預算斷路器記 $0 不會攔截。
 
 **門檻設定單位：單日新鮮 input tokens，不是 run 數。**
+
+---
+
+# Mac 完整一輪成本實測（2026-08-20）
+
+Step 4 一輪（Planner → G2 → G3 → Build → Independent Review → Watchdog），18 個相關 heartbeat run，其中 15 個產生 token cost event。
+
+| 類型 | Tokens |
+|---|---:|
+| Fresh input | **524,635** |
+| Cached input | 12,587,059 |
+| Output | 138,069 |
+| 總處理量 | 13,249,763 |
+
+帳面成本 `$0`（全部 `subscription_included`），**不代表沒有消耗訂閱配額**。
+
+## 按角色拆分 —— 與先前推論相反
+
+| Agent | Fresh input | 占比 | 總處理量 |
+|---|---:|---:|---:|
+| Design Reviewer（含 Watchdog） | 412,175 | **78.56%** | 7,670,595 |
+| Code Reviewer | 104,270 | 19.87% | 5,164,023 |
+| Planner | 7,602 | 1.45% | 319,718 |
+| **Coder** | **588** | **0.11%** | 95,427 |
+
+**Coder 只用了 588 個 fresh token；驗證側用了 516,445。**
+
+### 解讀陷阱
+
+WSL2 那輪量到 coder 燒 567,779 fresh，此處是 588，差三個數量級 —— **差別在快取狀態（冷啟動 vs 溫 session），不是工作量**。`fresh input` 主要反映快取未命中。
+
+更可靠的訊號是**總處理量**：`Anthropic 12,834,618 : OpenAI 415,145 ≈ 31 : 1`。這個比例快取解釋不了，驗證側確實做了約 31 倍的處理。
+
+## Watchdog 是單一最貴的元件
+
+| | Fresh input |
+|---|---:|
+| 核心五階段（不含 watchdog） | 264,312 |
+| 加上 watchdog | 524,635 |
+
+**Watchdog 一個就占 49.6%，幾乎讓整輪翻倍。**
+
+## 原因
+
+| 角色 | 工作形狀 | 成本隨什麼成長 |
+|---|---|---|
+| coder | 讀 spec → 寫檔 → 跑測試 → 回報，有界、約一趟 | 改動大小 |
+| design-reviewer | `reviewspec-design-review` 是**九步驟流程**，每步產出 artifact | spec 複雜度 |
+| code-reviewer | break-testing —— 改壞程式碼、重跑、確認測試會紅，本質多趟 | 測試數量 |
+| **watchdog** | 巡查**整棵子樹**：每個 issue、留言、文件、commit、測試、artifact | ⚠️ **子樹大小，非改動大小** |
+
+**核心洞察：驗證是搜尋，生成是單向流程。**
+
+Skill 體積只解釋約 2.2 倍（design-review skill 6,138 字，是 build 的 4.4 倍），其餘來自模型往返回合數 —— 每回合都重送累積 context，這也解釋了為何 cached input 高達 1,258 萬。
+
+**Watchdog 那一列是複利問題**：成本跟專案累積量成正比，不跟改動大小成正比。專案長大後，即使改一行字，watchdog 每次觸發都更貴。無人值守整夜的情境會隨時間惡化。
+
+## 對節流策略的修正
+
+**對 coder 設 `timeoutSec` 幾乎沒有意義**（588 tokens）。真正的槓桿是：
+
+1. **watchdog 掛在哪些 issue 上** —— 目前逐 issue 開啟，應該更挑，不要每個實作任務都掛
+2. **reviewer 的巡查範圍** —— 特別是 watchdog mandate 要求「巡完整棵子樹」，範圍需要隨專案成長設上限
+
+## 門檻基準
+
+```
+一輪完整五階段（含 watchdog）：約 525,000 fresh input tokens
+不含 watchdog：                 約 264,000
+```
+
+## 待實測
+
+回合數假設尚未在 Mac 上直接驗證。確認方式：
+
+```bash
+for f in ~/.paperclip/instances/default/data/run-logs/<companyId>/*/*.ndjson; do
+  n=$(grep -c '"tool_use"\|"function_call"\|"exec"' "$f")
+  echo "$n  $(basename $f)"
+done | sort -rn | head
+```
+
+若 reviewer 的 run 回合數是 coder 的 20 倍以上，結構性論證即得到實證。
 
 ## 尚未驗證
 
