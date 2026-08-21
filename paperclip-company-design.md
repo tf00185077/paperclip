@@ -756,6 +756,122 @@ Session 確實有重用（`sessionReused: true` + `persistedSessionId`），那�
 不含 watchdog：                 約 264,000
 ```
 
+---
+
+# 開放目標實驗：ai-music-to-sheet（2026-08-20 / 08-21）
+
+真實專案、刻意模糊的目標：「我想完成一個可用的、可驗證的，將音樂轉成譜的功能……大致流程我都寫在 README.md……架構都還是可以變動的狀態，不變的只有目的」。
+
+## Planner 面對開放目標的行為
+
+**沒有對話，沒有邊做邊問。讀 README → 研究 → 寫兩份文件 → 停在閘門。全程 60 秒。**
+
+三項預期全部命中：
+
+| 觀察點 | 結果 |
+|---|---|
+| 沿用既有架構還是另提一套 | **沿用並縮小範圍**：「本次不重新決定完整產品架構，也不選模型或技術棧」 |
+| 是否認出 README 指定的 M0 | ✅ build id 即 `m0-evaluation-foundation` |
+| 是否停在閘門不建子任務 | ✅ 0 子任務、`request_confirmation` pending、`board_only`、綁定 plan revision |
+
+超出預期的三點：
+
+1. **抓到使用者輸入與 README 的矛盾**（目標寫 MP4、README 寫 MP3／YouTube），判定不影響 M0，並明確拒絕「悄悄刪除需求」。
+2. 自行點出評估工具的核心失敗模式：「ground truth 必須和模型輸出分離，否則會把待測結果當答案而**產生假綠**」。
+3. 拒絕在無資料時編造數值門檻。
+
+## ⚠️ planner 指令缺口：五階段只建了一個任務
+
+**根因是 `AGENTS.md` 寫得不完整。** 原指令只說「建立實作任務並掛 `executionPolicy`」，**從未要求建立 design review 任務**；而 `paperclip-converting-plans-to-tasks` 又持續推「minimise the issue graph」。兩股力量都指向少建任務。
+
+後果：
+
+- `design-reviewer` **一次都沒跑**，`design-review.md` 不存在
+- coder 拒絕動工：「Waiting for required design input — `design-review.md` is absent」
+- code-reviewer 判 `FAIL — nothing to review`
+- coder 仍硬著頭皮實作 → **三輪 build → review → 退回**
+
+**跳過一道閘門的代價（受控對照）：**
+
+| | Mac Step 4（**有** design review） | 本次（**無**） |
+|---|---:|---:|
+| coder fresh input | 588 | **3,796,680** |
+| 總 fresh input | 524,635 | 約 **5,224,000** |
+| build → review 輪次 | 1 | **3** |
+
+**約 10 倍。** 因果鏈：沒有 design review → spec 歧義未被挖出 → coder 照自己的理解實作 → 對不上 → 重做三次。
+
+**修正**：planner 的 `AGENTS.md` 已明確要求建立 design review 任務、將實作任務 `blockedByIssueIds` 指向它，並註明「minimise the issue graph 是指不要把同一個人的工作切碎，不是授權合併角色或跳過閘門」。
+
+## code-reviewer 抓到假綠
+
+三輪獨立審查，結構為：獨立答案 key（**先建立自己的預期，再看 diff**）→ intent 覆蓋 → **break-testing** → 邊界審計 → 環境檢查 → 跨輪迴歸檢查。
+
+> 「deleted entirely with the full suite staying green. **That is fake green by the core's own definition**」
+
+某段程式碼整個刪掉、測試仍全綠 → 判 FAIL。並追蹤跨輪修復狀況（「Three of round 2's four findings are now genuinely fixed and survive break-testing」）。
+
+**這是 reviewspec 設計存在的理由，在真實任務上生效了。**
+
+## G3 有效：design review 問出 planner 沒問到的事
+
+補建 design review 任務後，`design-reviewer` 產出 `design-review.md`，並依指令將問題**批次成一個 `ask_user_questions` interaction**（3 題，各附三個選項）。
+
+**三題都不是 planner 那四題的複述，而是對抗式審查挖出的失敗模式：**
+
+| | 問題 | 性質 |
+|---|---|---|
+| Q1 | ground truth 用**自我宣告**的 `provenance.method="manual_annotation"` 證明它非來自系統輸出。**沒有結構性機制阻止把候選輸出複製進答案檔再貼上該標籤** | **攻擊 M0 核心承諾** |
+| Q2 | INT-3 承諾「可跨版本比較」，但未要求報告記錄產生該判定的門檻版本。門檻重校後，狀態改變與真實迴歸無法區分 | spec 承諾了自己支撐不了的東西 |
+| Q3 | 手工標註的 ground truth 遲早需修正；缺少獨立於 `schema_version` 的內容修訂 id，舊報告會被靜默與修正後答案比較 | 靜默污染 |
+
+Q1 最關鍵：planner 寫過「ground truth 必須和模型輸出分離」，那是**原則**；design-reviewer 把它變成攻擊 —— **你怎麼證明？** 答案是目前證明不了，靠一個誠信欄位。**沒有這道閘門，整個評估地基會建立在該欄位上，並污染下游每一次測量。**
+
+## ⚠️ interaction 預設沒有鎖給人類
+
+```
+G2 request_confirmation : board_only        ✅
+G3 ask_user_questions   : board_or_agents   ❌ agent 也能答
+```
+
+「只有使用者能回答的問題」預設**允許 agent 自行答掉**，人類永遠不會看到。公司層級的 `interactionResolverGovernance` 預設為 `{}`，等於不設限。
+
+**必要設定**（`PATCH /api/companies/:id`）：
+
+```json
+{"interactionResolverGovernance":{
+  "ask_user_questions":{"cap":"board_only"},
+  "request_confirmation":{"cap":"board_only"},
+  "request_checkbox_confirmation":{"cap":"board_only"},
+  "request_item_verdicts":{"cap":"board_only"}}}
+```
+
+**`cap` 不追溯既有 interaction** —— effective policy 在建立時就算好存起來。務必在建立 company 時就設定。
+
+## 中途修復可行（B 方案驗證）
+
+手動補建 design review 任務、將實作任務的 `blockedByIssueIds` 指向它，系統即從半路接回正軌：design review 執行 → 產出 artifact → 批次提問 → 使用者回答 → 任務 `done` → 阻塞自動解除。
+
+**但解除阻塞不等於恢復執行。**
+
+## ⚠️ 新的停滯型態：`changes_requested` 後停在人類身上
+
+MUS-3 完成、`blockedByIssueIds` 已清空後，實作任務仍停住：
+
+```
+status: in_review
+assigneeAgent: None   assigneeUser: local-board
+execState: pending | stage: review | lastOutcome: changes_requested
+returnAssignee: coder        ← 指向 coder，但實際停在 board
+```
+
+`returnAssignee` 指向 coder，卻停在使用者身上，**沒有任何 agent 會被喚醒**。這正是「`in_review` 但無活路徑」的停滯，**而該樹上沒有掛 watchdog，所以無人察覺**。
+
+**兩個操作教訓：**
+
+1. **交回 agent 時必須同時清掉 `assigneeUserId`** —— 單一指派人是硬性不變式，只設 `assigneeAgentId` 會被拒：`Issue can only have one assignee`。
+2. **執行政策退回後不保證自動回到 `returnAssignee`。** 若不掛 watchdog，這種停滯在無人值守時不會被發現。
+
 ## 待實測
 
 回合數假設尚未在 Mac 上直接驗證。確認方式：
