@@ -854,23 +854,62 @@ G3 ask_user_questions   : board_or_agents   ❌ agent 也能答
 
 **但解除阻塞不等於恢復執行。**
 
-## ⚠️ 新的停滯型態：`changes_requested` 後停在人類身上
+## `changes_requested` 三輪後停在人類身上 —— 這是斷路器，不是停滯
 
-MUS-3 完成、`blockedByIssueIds` 已清空後，實作任務仍停住：
+MUS-3 完成、`blockedByIssueIds` 已清空後，實作任務停在：
 
 ```
 status: in_review
 assigneeAgent: None   assigneeUser: local-board
 execState: pending | stage: review | lastOutcome: changes_requested
-returnAssignee: coder        ← 指向 coder，但實際停在 board
+returnAssignee: coder
 ```
 
-`returnAssignee` 指向 coder，卻停在使用者身上，**沒有任何 agent 會被喚醒**。這正是「`in_review` 但無活路徑」的停滯，**而該樹上沒有掛 watchdog，所以無人察覺**。
+> ⚠️ 曾將此判定為「新的停滯型態」並建議掛 watchdog。**讀過 `issue-execution-policy.ts` 後確認那是誤診。**
 
-**兩個操作教訓：**
+### 實際機制
 
-1. **交回 agent 時必須同時清掉 `assigneeUserId`** —— 單一指派人是硬性不變式，只設 `assigneeAgentId` 會被拒：`Issue can only have one assignee`。
-2. **執行政策退回後不保證自動回到 `returnAssignee`。** 若不掛 watchdog，這種停滯在無人值守時不會被發現。
+```ts
+const nextRounds = actorIsHuman ? 0 : (changesRequestedCount ?? 0) + 1;
+
+if (!actorIsHuman && nextRounds >= resolveMaxReviewRounds(policy)) {
+  → 指派給 reviewEscalationUserId(issue)
+}
+
+// 未達上限：
+patch.status = "in_progress";
+Object.assign(patch, patchForPrincipal(existingState.returnAssignee));   // 自動退回 coder
+```
+
+**平常 `changes_requested` 會自動退回 coder。** 我們遇到的是上限觸發 —— `DEFAULT_MAX_REVIEW_ROUNDS = 3`，而該輪正好是 FAIL → FAIL → FAIL。
+
+原始碼註解說明了意圖：
+
+> Human decisions reset the round counter: **the cap exists to stop unattended agent↔agent ping-pong**, not to limit human review.
+>
+> Rounds exhausted: keep the stage pending but hand it to the responsible human **instead of bouncing back to the implementer**.
+
+**這是專為「無人值守時 agent 互相踢皮球」設計的斷路器**，正是第 8 節成本失控最該防的情境。另有 sticky hold：升級後只有被指派的人能推進，其他 actor 會被擋（`Only the escalated reviewer can advance the current execution stage`）。修復 PATCH 之所以成功，是因為 `local_trusted` 下以 `local-board` 身分操作 —— 即被升級的那個人。
+
+**因此 watchdog 不是這裡的解法。** watchdog 的職責是把停下的工作推回去動起來，而此處的停止是刻意的；掛上去反而可能對抗斷路器。（watchdog 對其他停滯型態 —— `in_review` 無真實審查者、`blocked` 無 owner —— 仍然適用，那是獨立問題。）
+
+### ⚠️ 但斷路器可能靜默失效
+
+```ts
+function reviewEscalationUserId(issue) {
+  return issue.responsibleUserId?.trim()
+      ?? issue.createdByUserId?.trim()
+      ?? null;          // 兩者皆無 → 不升級
+}
+```
+
+**兩者皆無時回傳 `null`，斷路器不啟動，任務會無限次退回 coder。** 本次 company 有 `defaultResponsibleUserId: "local-board"` 故安全，但**由 agent 建立且無 responsible user 的 issue 會失去這道保護**。
+
+**必要檢查**：確保每個實作任務都有 responsible user 或 creator user。`maxReviewRounds` 可逐 policy 調整（預設 3）。
+
+### 操作教訓
+
+**交回 agent 時必須同時清掉 `assigneeUserId`** —— 單一指派人是硬性不變式，只設 `assigneeAgentId` 會被拒：`Issue can only have one assignee`。
 
 ## 待實測
 
