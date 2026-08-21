@@ -702,20 +702,45 @@ WSL2 那輪量到 coder 燒 567,779 fresh，此處是 588，差三個數量級 �
 
 **Watchdog 一個就占 49.6%，幾乎讓整輪翻倍。**
 
-## 原因
+## 原因 —— 經工具呼叫實測修正
 
-| 角色 | 工作形狀 | 成本隨什麼成長 |
-|---|---|---|
-| coder | 讀 spec → 寫檔 → 跑測試 → 回報，有界、約一趟 | 改動大小 |
-| design-reviewer | `reviewspec-design-review` 是**九步驟流程**，每步產出 artifact | spec 複雜度 |
-| code-reviewer | break-testing —— 改壞程式碼、重跑、確認測試會紅，本質多趟 | 測試數量 |
-| **watchdog** | 巡查**整棵子樹**：每個 issue、留言、文件、commit、測試、artifact | ⚠️ **子樹大小，非改動大小** |
+> ⚠️ 曾假設「驗證是搜尋、生成是單向流程，所以 reviewer 每 run 的工具呼叫更多」。**Mac 的 ACPX log 實測推翻了它。**
 
-**核心洞察：驗證是搜尋，生成是單向流程。**
+Step 4 權威數字：**400 unique tool calls / 18 runs**（先前的 483/27 含步驟 1–3 的兩個舊 agent）。
 
-Skill 體積只解釋約 2.2 倍（design-review skill 6,138 字，是 build 的 4.4 倍），其餘來自模型往返回合數 —— 每回合都重送累積 context，這也解釋了為何 cached input 高達 1,258 萬。
+| Agent | 類型 | Unique calls | Runs | **每 run 呼叫** | **每 run fresh** |
+|---|---|---:|---:|---:|---:|
+| Coder | Codex | 75 | 1 | **75.0** | **588** |
+| Planner | Codex | 112 | 4 | 28.0 | 1,901 |
+| Code Reviewer | Claude | 70 | 3 | 23.3 | 34,757 |
+| Design Reviewer | Claude | 143 | 10 | **14.3** | **41,218** |
 
-**Watchdog 那一列是複利問題**：成本跟專案累積量成正比，不跟改動大小成正比。專案長大後，即使改一行字，watchdog 每次觸發都更貴。無人值守整夜的情境會隨時間惡化。
+**Coder 的每-run 工具呼叫是 reviewer 平均（16.4）的 4.58 倍。** 那一輪 coder 跑了 RED→GREEN、controlled break-test、改碼與測試，單一 run 極度工具密集；reviewer 則被拆成多個較短的 run。
+
+## 真正的成本公式
+
+reviewer 的**每 run** fresh input 是 coder 的約 70 倍，但**工具呼叫更少**。兩者同時成立只有一個解釋：
+
+> **昂貴的不是 run 裡面做的事，是 run 的開場。**
+
+```
+成本 ≈ run 數 × 每 run 上下文重建
+```
+
+- Coder：1 個 run、75 次呼叫 —— 開場付一次，後續回合命中快取。
+- Design Reviewer：10 個 run —— **開場付十次**，而 10 個 run 主要來自 watchdog 反覆觸發。
+
+**槓桿是減少 run 數，不是減少每個 run 的工作量。**
+
+Skill 體積只解釋約 2.2 倍（design-review skill 6,138 字，是 build 的 4.4 倍），不是主因。
+
+## 待測子假設：快取 TTL 與 run 間隔
+
+Session 確實有重用（`sessionReused: true` + `persistedSessionId`），那為何每個 run 仍付 41k 開場？推測是 **session 重用但 prompt cache 已過期**（TTL 為分鐘級）。
+
+若成立，**「run 之間隔太久」本身就是成本**，而且反直覺：**把工作擠在一起做比分散做便宜**。這對「整夜零星喚醒」的情境不利。
+
+測法：將每個 run 的 `inputTokens` 對「距同一 agent 上一個 run 的時間差」作相關分析。
 
 ## 對節流策略的修正
 
